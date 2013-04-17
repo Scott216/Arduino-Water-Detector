@@ -6,6 +6,8 @@ Send a tweet if remote sensors go offline for more then a few minutes
 Use I2C to send info to PanStamp weather or not any sponges are wet, if so, flash RED LED
 See if you can request specific panStamp Tx data via I2C instead of sending both panStamps together in one packet
 Take a look at how your handle a panStamp being offline and see if you're doing it the best way
+Consider replacing Twitter with Tropo.com SMS service
+
 
 ====================
 Water Leak Detector.  Detects water leaks using sponge and op-amp circuit. 
@@ -24,11 +26,11 @@ a request for the data.  The panStamp will then transmit this as one long array 
 
 The sketch gets time from an NPT server.  Water detect notifications and low battery are sent out via Twitter.
 
-I had to shorten strings so I'd have enough RAM for the UNO.  
+Sketch is low on RAM
 
 Hardware:
-* Leak detector PCB - op-amp circuits, Uno, panstamp, screw terminals for wired sensors
-* UNO
+* Leak detector PCB 
+* Loenardo
 * panStamp
 * Ethernet shield R3
 * 3 op-amps: MCP6004 http://search.digikey.com/us/en/products/MCP6004-I%2FP/MCP6004-I%2FP-ND/523060
@@ -92,13 +94,12 @@ Byte 12-13: ADC value for battery voltage
 #include <Ethernet.h>      // http://arduino.cc/en/Reference/Ethernet
 #include <SPI.h>           // Allows you to communicate with SPI devices. See: http://arduino.cc/en/Reference/SPI
 #include <Twitter.h>       // http://arduino.cc/playground/Code/TwitterLibrary
-#include <Wire.h>          // For I2C communication with panStamp, http://www.arduino.cc/en/Reference/Wire
+#include <I2C.h>           // https://github.com/rambo/I2C
 #include <avr/wdt.h>       // Watchdog timer, Example code: http://code.google.com/p/arduwind/source/browse/trunk/ArduWind.ino
 #include <tokens.h>        // Contains twitter token
 #include "Water_Detect.h"  // Contains typedef for RemoteSensorData_t
 
-//byte mac[] = { 0x53, 0x52, 0x47, 0x46, 0x0B, 0x01 };  //  Ethernet shield doesn't work with this MAC
-byte mac[] = { 0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xE2 };  // This MAC works
+byte mac[] = { 0x90, 0xA2, 0xDA, 0xEF, 0x46, 0x81 };  
 
 #ifdef CRESTVIEW
   byte ip[] = { 192, 168, 216, 50 };  // Crestview
@@ -120,7 +121,7 @@ byte mac[] = { 0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xE2 };  // This MAC works
 #define HotTubFilter       7   // Sponge in crawlspace by hot tub filter and pump
 #define HotTubBack         8   // Sponge in crawlspace behind hot tub 
 #define WaterTank          9   // Sponge in crawlspace corner by water tank
-//Digital pins 10-13 are used for ethernet
+//Digital pins 10-13 are used for Ethernet
 
 #define WET HIGH       // When a sponge is wet, the digital input is HIGH
 #define DRY LOW        // When a sponge is dry, the digital input is LOW
@@ -135,6 +136,7 @@ const byte addrGuestBath =      2;  // panStamp device address for 2nd floor gue
 const byte numTransmitters =    2;  // number of panStamp transmitters on this network
 const byte numWiredInputs =    12;  // Number of wired water detector inputs
 bool gotI2CPacket = false;          // Flag to indicate I2C packet came in.  Sketch needs to know when I2C is working so it doesn't process bad data
+uint32_t checkNTPtimer =        0;  // Countdown timer to check NTP time
 
 #define addrSlaveI2C  21 // I2C Slave address of panStamp Rx
 
@@ -220,7 +222,10 @@ void setup ()
 
   printf_begin();  // Need this so the printf_P statements work
   
-  Wire.begin();  // Initialiae wire library for I2C communication
+  // Initialiae wire library for I2C communication
+  I2c.begin();
+  I2c.timeOut(30000);
+  
   #ifdef PRINT_DEBUG
     Serial.println(F("Wire library initialized"));
   #endif
@@ -237,7 +242,7 @@ void setup ()
   SendTweet("VT Water Leak Detector Restarted. ");  // Send startup tweet
 
   ProcessSensors();  // Check sensors to see if anything is wet
-
+ 
   #ifdef PRINT_DEBUG
     PrintStates();
   #endif
@@ -390,20 +395,27 @@ void loop ()
   {
     TweetCounter = 0; // Reset Tweet Counter
     char tweetMsg[100]; 
-    sprintf(tweetMsg, "Leak Detector: Master Bath = %d mV, Guest Bath = %d mV", masterBath.volts, guestBath.volts);
+    sprintf(tweetMsg, "Leak Detector: Master Bath = %d mV, Guest Bath = %d mV. ", masterBath.volts, guestBath.volts);
     SendTweet(tweetMsg);
     
-    // Reset timer once a week
-    uint8_t ntpTime[6];
-    if( getTime(ntpTime) )
-    { weeklyHeartbeatTimer = WeeklyCountdownTime(ntpTime); } // Set weekly countdown timer - Sunday noon
-    else
-    { weeklyHeartbeatTimer = millis() + 604800000UL; } // Couldn't get time from NTP server, just add 1 week in milliseconds
-
     #ifdef PRINT_DEBUG
       PrintStates();
     #endif
   }  // end weekly heartbeat
+
+  // Check time once every 2 days and reset countdown to Sunday noon
+  if( (long)( millis() -  checkNTPtimer) > 0 )
+  {
+    checkNTPtimer = millis() + MINUTE * 60 * 48;
+    uint8_t ntpTime[6];
+    if( getTime(ntpTime) )
+    { weeklyHeartbeatTimer = WeeklyCountdownTime(ntpTime); } // Set weekly countdown timer - Sunday noon
+    else
+    { 
+      weeklyHeartbeatTimer = millis() + 604800000UL; 
+      SendTweet("Failed to update NTP time. ");  // Send startup tweet
+    } // Couldn't get time from NTP server, just add 1 week in milliseconds
+  }
   
 }  // end loop()
 
@@ -633,12 +645,10 @@ bool ReadRFSensors(RemoteSensorData_t* rfsensor, byte panStampID)
   const byte panStampOffline =  255;  // if value in panStamp Tx ID byte is 255, it means the panStamp is offline
   byte panStampData[packetsPerPanStamp * numTransmitters];     // Array to hold panstamp data sent over
   int i = 0;
-  Wire.requestFrom(addrSlaveI2C, numTransmitters * packetsPerPanStamp);    // request data from panStamp I2C slave
 
-  while(Wire.available())    // slave may send less than requested
-  { 
-    panStampData[i] = Wire.read(); // receive a byte of data
-    i++;
+  int readstatus = I2c.read(addrSlaveI2C, numTransmitters * packetsPerPanStamp , panStampData); // request data from panStamp I2C slave
+  if(readstatus == 0)
+  {
     gotI2CPacket = true;  // Flag to indicate sketch received I2C packet
   }
 
